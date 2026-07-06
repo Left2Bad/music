@@ -21,9 +21,11 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
 except ImportError:  # pragma: no cover - optional dependency
     genai = None
+    genai_types = None
 
 
 AUDIO_EXTENSIONS = {
@@ -389,7 +391,7 @@ class MusicToolsApp:
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
         if genai is None:
-            return "Gemini: пакет google-generativeai не установлен"
+            return "Gemini: пакет google-genai не установлен"
         if not api_key:
             return f"Gemini: ключ не задан, модель по умолчанию {model_name}"
         return f"Gemini: готов, модель {model_name}"
@@ -627,7 +629,7 @@ class MusicToolsApp:
         if genai is None:
             messagebox.showerror(
                 "Gemini недоступен",
-                "Не установлен пакет google-generativeai. Поставь зависимости из requirements.txt.",
+                "Не установлен пакет google-genai. Поставь зависимости из requirements.txt.",
             )
             return
 
@@ -656,19 +658,15 @@ class MusicToolsApp:
 
     def _gemini_worker(self, api_key: str, model_name: str, examples: list[str], new_files: list[Path]) -> None:
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            payload = {
-                "examples": examples,
-                "new_files": [
-                    {
-                        "file_name": path.name,
-                        "stem": path.stem,
-                        "suffix": path.suffix,
-                    }
-                    for path in new_files
-                ],
-            }
+            client = genai.Client(api_key=api_key)
+            new_files_payload = [
+                {
+                    "file_name": path.name,
+                    "stem": path.stem,
+                    "suffix": path.suffix,
+                }
+                for path in new_files
+            ]
             prompt = (
                 "Ты переименовываешь аудиофайлы в музыкальной библиотеке.\n"
                 "Проанализируй стиль примеров и предложи новые названия для файлов из New.\n"
@@ -683,10 +681,13 @@ class MusicToolsApp:
                 "\nПримеры имён из библиотеки (каждое второе, максимум 100):\n"
                 f"{json.dumps(examples, ensure_ascii=False, indent=2)}\n"
                 "\nНовые файлы в папке New:\n"
-                f"{json.dumps(payload['new_files'], ensure_ascii=False, indent=2)}\n"
+                f"{json.dumps(new_files_payload, ensure_ascii=False, indent=2)}\n"
             )
-            response = model.generate_content(prompt)
-            text = getattr(response, "text", "") or ""
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            text = response.text or ""
             parsed = split_response_json(text)
             renames = self.normalize_gemini_output(parsed, new_files)
             self.worker_queue.put(("gemini_done", renames))
@@ -716,6 +717,10 @@ class MusicToolsApp:
             proposed = normalize_target_filename(proposed, path.suffix)
             rows.append(RenamePreviewRow(source=path, proposed_name=proposed, selected=True))
         return rows
+
+    def progress_bar_reset(self) -> None:
+        if self.progress_bar is not None:
+            self.progress_bar["value"] = 0
 
     def handle_polling_done(self) -> None:
         self.active_worker = None
@@ -970,208 +975,7 @@ class MusicToolsApp:
         ttk.Button(button_row, text="Отмена", command=editor.destroy).pack(side=LEFT, padx=10)
         editor.bind("<Return>", lambda _event: save())
 
-    def organize_non_mp3_files(self, library_files: list[Path]) -> list[tuple[str, str]]:
-        moved: list[tuple[str, str]] = []
-        for source in library_files:
-            if source.suffix.lower() == ".mp3":
-                continue
-            format_dir = self.music_root / source.suffix.lower().lstrip(".")
-            ensure_directory(format_dir)
-            destination = unique_destination_path(format_dir, source.name)
-            if source.resolve() == destination.resolve():
-                continue
-            if source.parent.resolve() == format_dir.resolve() and source.name == destination.name:
-                continue
-            shutil.move(str(source), str(destination))
-            moved.append((source.name, str(destination)))
-        return moved
 
-    def convert_non_mp3_to_root_mp3(self, ffmpeg_path: str) -> dict[str, Any]:
-        library_files = self.library_files()
-        organized = self.organize_non_mp3_files(library_files)
-        convert_sources = [path for path in self.library_files() if path.suffix.lower() != ".mp3"]
-        total = len(convert_sources)
-        converted = 0
-        errors = 0
-
-        for index, source in enumerate(convert_sources, start=1):
-            destination = unique_destination_path(self.music_root, f"{source.stem}.mp3")
-            try:
-                convert_audio_file(ffmpeg_path, source, destination)
-                converted += 1
-                self.worker_queue.put(("progress", (index, total, f"OK: {source.name} -> {destination.name}")))
-            except Exception as exc:  # noqa: BLE001
-                errors += 1
-                self.worker_queue.put(("progress", (index, total, f"Ошибка: {source.name} ({exc})")))
-
-        self.last_output_dir = self.music_root
-        return {
-            "converted": converted,
-            "organized": len(organized),
-            "errors": errors,
-            "output_dir": self.music_root,
-            "target_format": "mp3",
-        }
-
-    def collect_reference_examples(self, limit: int = 100) -> list[str]:
-        examples = [path.stem for path in self.library_files()][::2]
-        return examples[:limit]
-
-    def collect_new_files(self) -> list[Path]:
-        ensure_directory(self.new_folder)
-        return self.new_files()
-
-    def start_gemini_analysis(self) -> None:
-        if self.active_worker and self.active_worker.is_alive():
-            messagebox.showinfo("Обработка", "Сейчас уже идет другая операция. Подожди завершения.")
-            return
-
-        if genai is None:
-            messagebox.showerror(
-                "Gemini недоступен",
-                "Не установлен пакет google-generativeai. Поставь зависимости из requirements.txt.",
-            )
-            return
-
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not api_key:
-            messagebox.showerror("Gemini недоступен", "В .env не задан GEMINI_API_KEY.")
-            return
-
-        new_files = self.collect_new_files()
-        if not new_files:
-            messagebox.showinfo("New пустой", "В папке New нет файлов для переименования.")
-            return
-
-        examples = self.collect_reference_examples()
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
-
-        self.current_task = "gemini"
-        self.status_var.set("Отправляю файлы в Gemini...")
-        self.active_worker = threading.Thread(
-            target=self._gemini_worker,
-            args=(api_key, model_name, examples, new_files),
-            daemon=True,
-        )
-        self.active_worker.start()
-        self.root.after(120, self.poll_worker_queue)
-
-    def _gemini_worker(self, api_key: str, model_name: str, examples: list[str], new_files: list[Path]) -> None:
-        try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            payload = {
-                "examples": examples,
-                "new_files": [
-                    {
-                        "file_name": path.name,
-                        "stem": path.stem,
-                        "suffix": path.suffix,
-                    }
-                    for path in new_files
-                ],
-            }
-            prompt = (
-                "Ты переименовываешь аудиофайлы в музыкальной библиотеке.\n"
-                "Проанализируй стиль примеров и предложи новые названия для файлов из New.\n"
-                "Верни ТОЛЬКО JSON без пояснений и без markdown.\n"
-                "Формат ответа: {\"renames\":[{\"file_name\":\"old.ext\",\"new_name\":\"Artist - Title\"}]}\n"
-                "Правила:\n"
-                "- new_name не должен содержать путь.\n"
-                "- Расширение не указывай, оно сохранится из исходного файла.\n"
-                "- Сохраняй стиль именования из примеров.\n"
-                "- Если стиль примеров допускает сокращения, используй их.\n"
-                "- Верни ответ для каждого файла из списка new_files.\n"
-                "\nПримеры имён из библиотеки (каждое второе, максимум 100):\n"
-                f"{json.dumps(examples, ensure_ascii=False, indent=2)}\n"
-                "\nНовые файлы в папке New:\n"
-                f"{json.dumps(payload['new_files'], ensure_ascii=False, indent=2)}\n"
-            )
-            response = model.generate_content(prompt)
-            text = getattr(response, "text", "") or ""
-            parsed = split_response_json(text)
-            renames = self.normalize_gemini_output(parsed, new_files)
-            self.worker_queue.put(("gemini_done", renames))
-        except Exception as exc:  # noqa: BLE001
-            self.worker_queue.put(("error", f"Gemini: {exc}"))
-
-    def normalize_gemini_output(self, parsed: Any, new_files: list[Path]) -> list[RenamePreviewRow]:
-        candidates: dict[str, str] = {}
-        if isinstance(parsed, dict):
-            items = parsed.get("renames", [])
-        elif isinstance(parsed, list):
-            items = parsed
-        else:
-            raise ValueError("Gemini returned unsupported structure")
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            source_name = str(item.get("file_name") or item.get("file") or item.get("source") or "").strip()
-            new_name = str(item.get("new_name") or item.get("new") or item.get("name") or "").strip()
-            if source_name:
-                candidates[source_name] = new_name
-
-        rows: list[RenamePreviewRow] = []
-        for path in new_files:
-            proposed = candidates.get(path.name, path.stem)
-            proposed = normalize_target_filename(proposed, path.suffix)
-            rows.append(RenamePreviewRow(source=path, proposed_name=proposed, selected=True))
-        return rows
-
-    def handle_polling_done(self) -> None:
-        self.active_worker = None
-        self.current_task = None
-        self.progress_bar_reset()
-
-    def poll_worker_queue(self) -> None:
-        while True:
-            try:
-                kind, payload = self.worker_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            if kind == "progress":
-                current, total, message = payload
-                total = max(int(total), 1)
-                current = int(current)
-                if self.progress_bar is not None:
-                    self.progress_bar["value"] = int((current / total) * 100)
-                self.status_var.set(str(message))
-            elif kind == "gemini_done":
-                self.handle_polling_done()
-                self.handle_gemini_result(payload)
-            elif kind == "done":
-                self.handle_polling_done()
-                self.handle_conversion_result(payload)
-            elif kind == "error":
-                self.handle_polling_done()
-                messagebox.showerror("Ошибка", str(payload))
-
-        if self.active_worker and self.active_worker.is_alive():
-            self.root.after(120, self.poll_worker_queue)
-
-    def handle_conversion_result(self, payload: dict[str, Any]) -> None:
-        self.refresh_all()
-        target_format = payload.get("target_format", "")
-        if target_format == "mp3":
-            message = (
-                f"Готово: mp3 созданы {payload.get('converted', 0)} раз, разложено по папкам {payload.get('organized', 0)} файлов, ошибок {payload.get('errors', 0)}."
-            )
-        else:
-            message = (
-                f"Готово: {payload.get('converted', 0)} файлов, ошибок {payload.get('errors', 0)}. Папка: {payload.get('output_dir')}"
-            )
-        self.status_var.set(message)
-        messagebox.showinfo("Конвертация завершена", message)
-
-    def handle_gemini_result(self, rows: list[RenamePreviewRow]) -> None:
-        self.preview_rows = rows
-        self.open_preview_window()
-        self.status_var.set(f"Gemini предложил переименование для {len(rows)} файлов")
-
-    def unique_root_target(self, desired_filename: str) -> Path:
-        return unique_destination_path(self.music_root, desired_filename)
 
     def run(self) -> None:
         self.root.mainloop()
