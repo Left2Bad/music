@@ -256,8 +256,30 @@ class MusicToolsApp:
         style.configure("StatCaption.TLabel", font=("Segoe UI", 10), foreground="#94a3b8", background="#151b28")
         style.configure("TButton", font=("Segoe UI Semibold", 10), padding=8)
         style.map("TButton", foreground=[("active", "#ffffff")])
-        style.configure("Treeview", font=("Segoe UI", 10), rowheight=28)
-        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10))
+        style.configure(
+            "Treeview",
+            font=("Segoe UI", 10),
+            rowheight=28,
+            background="#10151f",
+            fieldbackground="#10151f",
+            foreground="#e5e7eb",
+            bordercolor="#243042",
+            lightcolor="#243042",
+            darkcolor="#243042",
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", "#2563eb")],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.configure(
+            "Treeview.Heading",
+            font=("Segoe UI Semibold", 10),
+            background="#151b28",
+            foreground="#f8fafc",
+            relief="flat",
+        )
+        style.map("Treeview.Heading", background=[("active", "#1f2937")], foreground=[("active", "#ffffff")])
         style.configure("TCombobox", padding=6)
         style.configure("Horizontal.TProgressbar", thickness=16)
 
